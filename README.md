@@ -20,7 +20,7 @@ narrowing sites exhibit preferential short-range ER contact at those sites, a sp
 signature consistent with models of ER-mediated mitochondrial remodelling.
 
 <p align="center">
-  <img src="figures/automated_segmentation.png" alt="Automated segmentation overview" width="800">
+  <img src="figures/automated_segmentation.png" alt="Automated segmentation overview" width="600">
 </p>
 
 ## Repository Contents
@@ -158,7 +158,7 @@ ER–mitochondria narrowing-site analyses described in the manuscript:
 python mito_er_analysis.py cluster \
   --feature_csv /path/to/mito_features.csv \
   --output_root /path/to/output \
-  --ks_threshold 0.1
+  --ks_threshold <ks_threshold>
 
 python mito_er_analysis.py hepatocyte \
   --pca_csv /path/to/output/pca_features.csv \
@@ -166,17 +166,17 @@ python mito_er_analysis.py hepatocyte \
   --mito_instance_folder /path/to/mito_instance_masks \
   --outlier_mask /path/to/outlier_mask \
   --output_dir /path/to/output \
-  --z_threshold 6
+  --z_threshold <min_z_span>
 
 python mito_er_analysis.py er-mito \
   --mito_folder /path/to/mito_instance_masks \
   --er_folder /path/to/er_masks \
   --cluster_csv /path/to/output/pca_features.csv \
   --output_dir /path/to/output \
-  --z_end 596 \
-  --tile_size 2000 --grid_cols 10 \
-  --exclude_end_fraction 0.1 --min_ratio_threshold 0.7 \
-  --n_slices 20 --near_fraction 0.5
+  --z_end <z_extent> \
+  --tile_size <tile_size> --grid_cols <grid_cols> \
+  --exclude_end_fraction <fraction> --min_ratio_threshold <ratio> \
+  --n_slices <n_slices> --near_fraction <fraction>
 
 python mito_er_analysis.py enrichment \
   --result_dir /path/to/output \
