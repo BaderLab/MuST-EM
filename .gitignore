@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.ipynb_checkpoints/
+.DS_Store
+
+# Model checkpoints / large binaries (distributed via Zenodo, see README)
+*.pth
+*.pt
+*.ckpt
+
+# Local environments
+venv/
+.venv/
+env/

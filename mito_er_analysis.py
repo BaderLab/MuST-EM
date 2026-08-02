@@ -13,17 +13,10 @@ from 3D electron microscopy data. Key analysis steps include:
 
 Usage
 -----
-    python feature_analysis.py --feature_csv <path> --output_root <path> [options]
+    python mito_er_analysis.py cluster --feature_csv <path> --output_root <path> [options]
 
-See ``if __name__ == "__main__"`` block or ``--help`` for full CLI.
-
-Authors
--------
-<Your name / lab>
-
-License
--------
-<Your license>
+Subcommands: ``cluster``, ``hepatocyte``, ``er-mito``, ``enrichment``.
+Run ``python mito_er_analysis.py <subcommand> --help`` for the full CLI of each stage.
 """
 
 # =============================================================================
@@ -40,7 +33,6 @@ import os
 import pickle
 from typing import Any, Dict, Optional, Tuple
 
-import cv2
 import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
@@ -151,7 +143,10 @@ def _fit_skewnorm(
         }
         return index, fit_info
 
-    except Exception as exc:
+    except (RuntimeError, ValueError, FloatingPointError) as exc:
+        # Only catch errors expected from a failed distribution fit (e.g.
+        # scipy optimizer non-convergence); anything else (bad arguments,
+        # programming errors) should propagate instead of being masked.
         logger.warning("[%s] Skew-normal fit failed (%s); using empirical percentile.", name, exc)
         return (
             _empirical_percentile(values),
@@ -301,8 +296,9 @@ def get_instance_mask(
     Supports optional z-cropping and spatial tiling.
     """
     files = sorted(
-        f for f in os.listdir(input_folder)
-        if f.lower().endswith((".tif", ".tiff", ".png"))
+        (f for f in os.listdir(input_folder)
+         if f.lower().endswith((".tif", ".tiff", ".png"))),
+        key=_extract_index_from_filename,
     )
     if not files:
         raise ValueError(f"No image files found in {input_folder}")
@@ -718,6 +714,7 @@ def cluster_feature(
     high_conf: float,
     low_conf: float,
     outlier_threshold: float,
+    ks_threshold: float,
     random_state: int = 42,
 ) -> Tuple[pd.DataFrame, dict]:
     """Run PCA on radiomics features and compute morphology indices.
@@ -735,6 +732,11 @@ def cluster_feature(
         CDF thresholds for soft label assignment.
     outlier_threshold : float
         Z-score beyond which samples are removed.
+    ks_threshold : float
+        Kolmogorov-Smirnov D-statistic above which the skew-normal fit is
+        rejected in favour of an empirical-percentile fallback. Dataset
+        dependent — inspect the KS D values logged for your PC1/PC2 fits
+        and choose accordingly (there is no generic default).
     random_state : int
         Seed for reproducibility.
 
@@ -821,8 +823,8 @@ def cluster_feature(
     evr = pca_final.explained_variance_ratio_
 
     # Skew-normal indices
-    ei_pc1, fit_info_pc1 = _fit_skewnorm(pc1, "PC1")
-    ei_pc2, fit_info_pc2 = _fit_skewnorm(pc2, "PC2")
+    ei_pc1, fit_info_pc1 = _fit_skewnorm(pc1, "PC1", ks_threshold=ks_threshold)
+    ei_pc2, fit_info_pc2 = _fit_skewnorm(pc2, "PC2", ks_threshold=ks_threshold)
     labels = _assign_soft_labels(ei_pc1, high_conf, low_conf)
 
     unique, counts = np.unique(labels, return_counts=True)
@@ -1049,6 +1051,7 @@ def per_hepatocyte_mito_distribution(
     output_dir: str,
     high_conf: float,
     low_conf: float,
+    z_threshold: int,
     cache_file: Optional[str] = None,
     force_recompute: bool = False,
 ) -> Tuple[pd.DataFrame, dict, dict, pd.DataFrame]:
@@ -1066,6 +1069,9 @@ def per_hepatocyte_mito_distribution(
         Path to ``outlier_mask.npy`` from ``cluster_feature``.
     output_dir : str
         Directory for figures and cache.
+    z_threshold : int
+        Minimum z-span (in slices) for a mitochondrion instance to be kept.
+        Dataset-specific — use the same value as `morphology_features.py`.
     cache_file : str, optional
         Path for pickle cache (speeds up re-runs).
 
@@ -1097,7 +1103,7 @@ def per_hepatocyte_mito_distribution(
     # --- Load masks ---
     logger.info("Loading hepatocyte and mitochondria masks...")
     hep_lab = get_mask_hepa(hepatocyte_mask_folder)
-    inst = zfiltering(get_instance_mask(mito_instance_folder))
+    inst = zfiltering(get_instance_mask(mito_instance_folder), z_threshold)
     mito_regs = regionprops(inst)
     logger.info("Mitochondria regions: %d", len(mito_regs))
 
@@ -1284,7 +1290,8 @@ def find_middle_region(
 def _analyze_single_mito(args: tuple) -> Optional[dict]:
     """Worker function for parallel narrowing + ER contact analysis."""
     (mito_id, mito_mask, er_crop, zmin, mito_info,
-     pc2_low, pc2_high, exclude_end_frac, min_ratio_thr, is_narrowing) = args
+     pc2_low, pc2_high, exclude_end_frac, min_ratio_thr, is_narrowing,
+     n_slices, near_fraction) = args
 
     try:
         pc2 = mito_info.get("PC2", 0)
@@ -1301,15 +1308,20 @@ def _analyze_single_mito(args: tuple) -> Optional[dict]:
             (constrict_pos, constrict_pt, ratio,
              near_surf, far_surf, valid) = find_narrowing_site(
                 mito_mask, surface_coords,
+                n_slices=n_slices,
                 exclude_end_fraction=exclude_end_frac,
                 min_ratio_threshold=min_ratio_thr,
             )
             # Fallback: if no valid constriction found, use middle 50%
             if not valid:
-                near_surf, far_surf = find_middle_region(mito_mask, surface_coords)
+                near_surf, far_surf = find_middle_region(
+                    mito_mask, surface_coords, near_fraction=near_fraction
+                )
                 valid = True
         else:
-            near_surf, far_surf = find_middle_region(mito_mask, surface_coords)
+            near_surf, far_surf = find_middle_region(
+                mito_mask, surface_coords, near_fraction=near_fraction
+            )
             constrict_pos = constrict_pt = ratio = None
             valid = True
 
@@ -1449,11 +1461,13 @@ def analyze_narrowing_mito_er_interaction(
     pc1_high: float = None,
     exclude_end_fraction: float = None,
     min_ratio_threshold: float = None,
+    n_slices: int = None,
+    near_fraction: float = None,
     coord_space: str = None,
     tile_size: int = None,
     grid_cols: int = None,
-    bbox_tolerance: int = None,
-    downsample_tolerance: int = None,
+    bbox_tolerance: int = 0,
+    downsample_tolerance: int = 0,
     z_range: Optional[Tuple[int, int]] = None,
     tile_id: Optional[int] = None,
     save_visualization: bool = True,
@@ -1469,13 +1483,24 @@ def analyze_narrowing_mito_er_interaction(
     ----------
     tile_id : int, optional
         Defaults to ``SLURM_ARRAY_TASK_ID`` environment variable or 0.
+    n_slices : int
+        Number of cross-sections sampled along the mitochondrion's major
+        axis when searching for a narrowing site. Dataset/resolution
+        dependent; must be supplied by the caller.
+    near_fraction : float
+        Fraction (0-1) of the major-axis length defined as "near" the
+        narrowing site (or, for non-narrowing mitochondria, the middle
+        region). Dataset dependent; must be supplied by the caller.
     is_narrowing : bool
         If True, analyse narrowing sites; if False, use the middle 50 %.
     """
     if tile_id is None:
         tile_id = int(os.environ.get("SLURM_ARRAY_TASK_ID", 0))
     if z_range is None:
-        z_range = (0, 596)
+        raise ValueError(
+            "z_range must be specified (start, end) — it depends on the "
+            "z-extent of your volume and has no generic default."
+        )
 
     os.makedirs(output_dir_base, exist_ok=True)
     output_csv = os.path.join(
@@ -1497,8 +1522,14 @@ def analyze_narrowing_mito_er_interaction(
     analysis_df = analysis_df.reset_index(drop=True)
 
     # Load volumes
-    mito_vol = get_instance_mask(input_folder_mito, zrange=z_range, tile_number=tile_id)
-    er_vol = get_instance_mask(input_folder_er, zrange=z_range, tile_number=tile_id)
+    mito_vol = get_instance_mask(
+        input_folder_mito, zrange=z_range, tile_number=tile_id,
+        tile_size=tile_size, grid_size=grid_cols,
+    )
+    er_vol = get_instance_mask(
+        input_folder_er, zrange=z_range, tile_number=tile_id,
+        tile_size=tile_size, grid_size=grid_cols,
+    )
     props = regionprops(mito_vol)
     logger.info("Tile %d: %d mito regions, volume shape %s",
                 tile_id, len(props), mito_vol.shape)
@@ -1528,6 +1559,7 @@ def analyze_narrowing_mito_er_interaction(
             sl[0].start + z_range[0], info,
             pc2_narrowing_low, pc2_narrowing_high,
             exclude_end_fraction, min_ratio_threshold, is_narrowing,
+            n_slices, near_fraction,
         ))
 
     with mp.Pool(processes=mp.cpu_count()) as pool:
@@ -1587,8 +1619,15 @@ def statistical_tests(
     df: pd.DataFrame,
     enrichment_col: str = "enrichment_nearby_far",
     n_perm: int = 10_000,
+    random_state: Optional[int] = None,
 ) -> dict:
     """Statistical tests for median enrichment against H₀: median = 1.
+
+    Parameters
+    ----------
+    random_state : int, optional
+        Seed for the sign-flip permutation test's RNG. Leave unset for a
+        non-reproducible run; set explicitly to reproduce a reported p-value.
 
     Returns a dictionary with permutation p-value, binomial test, effect size.
     """
@@ -1602,10 +1641,11 @@ def statistical_tests(
     robust_d = median_diff / obs_mad if obs_mad != 0 else 0
 
     # One-sample sign-flip permutation test
+    rng = np.random.default_rng(random_state)
     diffs = enrichment - 1.0
     perm_stats = np.zeros(n_perm)
     for i in range(n_perm):
-        signs = np.random.choice([-1, 1], size=n)
+        signs = rng.choice([-1, 1], size=n)
         perm_stats[i] = np.median(diffs * signs)
     p_perm = float((np.abs(perm_stats) >= np.abs(median_diff)).mean())
 
@@ -1746,6 +1786,7 @@ def analyze_er_mito_enrichment(
     file_pattern: str = "er_mito_narrowing_pc2_*_tile*.csv",
     prefix: str = "er_mito_enrichment",
     min_median_ratio_threshold: float = None,
+    random_state: Optional[int] = None,
 ) -> Tuple[pd.DataFrame, dict]:
     """End-to-end ER–mito enrichment analysis across all tiles.
 
@@ -1769,7 +1810,9 @@ def analyze_er_mito_enrichment(
         return df, {}
 
     df_valid = compute_enrichment_metrics(df_valid)
-    stats_results = statistical_tests(df_valid, "enrichment_nearby_far")
+    stats_results = statistical_tests(
+        df_valid, "enrichment_nearby_far", random_state=random_state
+    )
     plot_enrichment_analysis(df_valid, output_dir, prefix)
 
     output_csv = os.path.join(output_dir, f"{prefix}_combined.csv")
@@ -1797,6 +1840,11 @@ def _build_parser() -> argparse.ArgumentParser:
     cl.add_argument("--high_conf", type=float, default=0.6)
     cl.add_argument("--low_conf", type=float, default=0.4)
     cl.add_argument("--outlier_threshold", type=float, default=4.0)
+    cl.add_argument("--ks_threshold", type=float, required=True,
+                     help="KS D-statistic above which the skew-normal fit "
+                          "is rejected for an empirical-percentile "
+                          "fallback. Dataset-specific; inspect the logged "
+                          "KS D values for your PC1/PC2 fits to choose it.")
     cl.add_argument("--random_state", type=int, default=42)
 
     # --- hepatocyte ---
@@ -1808,6 +1856,10 @@ def _build_parser() -> argparse.ArgumentParser:
     hp.add_argument("--output_dir", required=True)
     hp.add_argument("--high_conf", type=float, default=0.8)
     hp.add_argument("--low_conf", type=float, default=0.2)
+    hp.add_argument("--z_threshold", type=int, required=True,
+                     help="Minimum z-span (slices) for a mitochondrion "
+                          "instance to be kept; use the same value as "
+                          "morphology_features.py --z-threshold.")
 
     # --- er-mito ---
     em = sub.add_parser("er-mito", help="ER–mitochondria narrowing analysis.")
@@ -1819,9 +1871,39 @@ def _build_parser() -> argparse.ArgumentParser:
     em.add_argument("--pc2_high", type=float, default=0.8)
     em.add_argument("--pc1_low", type=float, default=0)
     em.add_argument("--pc1_high", type=float, default=10)
-    em.add_argument("--tile_id", type=int, default=None)
-    em.add_argument("--z_start", type=int, default=0)
-    em.add_argument("--z_end", type=int, default=596)
+    em.add_argument("--tile_id", type=int, default=None,
+                     help="Tile index. Defaults to $SLURM_ARRAY_TASK_ID or 0.")
+    em.add_argument("--z_start", type=int, default=0,
+                     help="First z-slice (inclusive) of the volume to load.")
+    em.add_argument("--z_end", type=int, required=True,
+                     help="Last z-slice (exclusive) of the volume to load. "
+                          "Dataset-specific — set to your volume's z-extent.")
+    em.add_argument("--coord_space", choices=["2k", "10k"], default=None,
+                     help="Which bbox coordinate columns to match against "
+                          "in the cluster CSV (bbox_*_2k vs bbox_*_10k).")
+    em.add_argument("--tile_size", type=int, required=True,
+                     help="Tile edge length in pixels (dataset-specific).")
+    em.add_argument("--grid_cols", type=int, required=True,
+                     help="Number of tile columns in the acquisition grid "
+                          "(dataset-specific).")
+    em.add_argument("--bbox_tolerance", type=int, default=0,
+                     help="Extra pixel tolerance when matching volume "
+                          "regions to CSV bounding boxes.")
+    em.add_argument("--downsample_tolerance", type=int, default=0,
+                     help="Additional pixel tolerance to account for "
+                          "coordinate downsampling error.")
+    em.add_argument("--exclude_end_fraction", type=float, required=True,
+                     help="Fraction of the major axis excluded at each end "
+                          "when searching for a narrowing site (0-0.5).")
+    em.add_argument("--min_ratio_threshold", type=float, required=True,
+                     help="Max cross-section-area ratio (narrowest/median) "
+                          "to qualify as a narrowing site.")
+    em.add_argument("--n_slices", type=int, required=True,
+                     help="Number of cross-sections sampled along the major "
+                          "axis when searching for a narrowing site.")
+    em.add_argument("--near_fraction", type=float, required=True,
+                     help="Fraction (0-1) of the major-axis length defined "
+                          "as 'near' the narrowing site / middle region.")
     em.add_argument("--is_narrowing", action="store_true", default=True)
     em.add_argument("--no_narrowing", dest="is_narrowing", action="store_false")
 
@@ -1831,6 +1913,9 @@ def _build_parser() -> argparse.ArgumentParser:
     en.add_argument("--output_dir", default=None)
     en.add_argument("--file_pattern", default="er_mito_narrowing_pc2_*_tile*.csv")
     en.add_argument("--min_median_ratio", type=float, default=0.8)
+    en.add_argument("--random_state", type=int, default=None,
+                     help="Seed for the sign-flip permutation test RNG. "
+                          "Set explicitly for a reproducible p-value.")
 
     return p
 
@@ -1846,6 +1931,7 @@ if __name__ == "__main__":
             high_conf=args.high_conf,
             low_conf=args.low_conf,
             outlier_threshold=args.outlier_threshold,
+            ks_threshold=args.ks_threshold,
             random_state=args.random_state,
         )
 
@@ -1858,6 +1944,7 @@ if __name__ == "__main__":
             output_dir=args.output_dir,
             high_conf=args.high_conf,
             low_conf=args.low_conf,
+            z_threshold=args.z_threshold,
         )
 
     elif args.command == "er-mito":
@@ -1870,6 +1957,15 @@ if __name__ == "__main__":
             pc2_narrowing_high=args.pc2_high,
             pc1_low=args.pc1_low,
             pc1_high=args.pc1_high,
+            exclude_end_fraction=args.exclude_end_fraction,
+            min_ratio_threshold=args.min_ratio_threshold,
+            n_slices=args.n_slices,
+            near_fraction=args.near_fraction,
+            coord_space=args.coord_space,
+            tile_size=args.tile_size,
+            grid_cols=args.grid_cols,
+            bbox_tolerance=args.bbox_tolerance,
+            downsample_tolerance=args.downsample_tolerance,
             z_range=(args.z_start, args.z_end),
             tile_id=args.tile_id,
             is_narrowing=args.is_narrowing,
@@ -1881,6 +1977,7 @@ if __name__ == "__main__":
             output_dir=args.output_dir,
             file_pattern=args.file_pattern,
             min_median_ratio_threshold=args.min_median_ratio,
+            random_state=args.random_state,
         )
 
     else:

@@ -1,5 +1,3 @@
-import sys
-sys.path.append("/home/codee/scratch/nnUNet")
 import argparse
 import os.path
 from copy import deepcopy

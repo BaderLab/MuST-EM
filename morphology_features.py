@@ -12,6 +12,15 @@ from 3D instance-segmented electron microscopy (EM) volumes. It supports:
 Designed for large-scale subcellular morphometry (e.g. mitochondria) in
 serial-section EM datasets.
 
+Usage
+-----
+    python morphology_features.py segment --input-dir <masks> --output-dir <out> [options]
+    python morphology_features.py track   --input-dir <labelled> --output-dir <out> [options]
+    python morphology_features.py extract --instance-dir <tracked> --em-dir <em> --output-csv <csv> [options]
+
+Run ``python morphology_features.py <subcommand> --help`` for the full CLI of
+each stage.
+
 References
 ----------
 van Griethuysen, J.J.M. et al. Computational Radiomics System to Decode the
@@ -40,7 +49,6 @@ from scipy.ndimage import (
     zoom,
 )
 from scipy.spatial.distance import cdist
-from skimage.feature import peak_local_max
 from skimage.io import imread
 from skimage.measure import label, regionprops
 from skimage.morphology import (
@@ -114,7 +122,8 @@ class MorphDescriptor:
             Normalised 3D EM volume.
         """
         png_files = sorted(
-            f for f in os.listdir(folder) if f.endswith(".png")
+            (f for f in os.listdir(folder) if f.endswith(".png")),
+            key=_extract_index,
         )
         if not png_files:
             raise FileNotFoundError(f"No PNG files found in {folder}")
@@ -296,17 +305,22 @@ class MorphDescriptor:
 def segment_slice(
     file_path: str,
     output_dir: str,
-    opening_radius: int = None,
-    min_size: int = None,
-    h_max_threshold: float = None,
-    gaussian_sigma: float = None,
-    distance_sigma: float = None,
+    opening_radius: int = 0,
+    min_size: int = 0,
+    h_max_threshold: float = 0.0,
+    gaussian_sigma: float = 0.0,
+    distance_sigma: float = 0.0,
 ) -> None:
     """Watershed-based instance segmentation of a single 2D binary mask.
 
     The pipeline: binarise → remove small objects → fill holes → (optional)
     morphological opening → Gaussian smoothing → distance transform →
     h-maxima suppression → watershed.
+
+    All keyword arguments default to a no-op value (0), i.e. no opening, no
+    size filtering, no smoothing, and no h-maxima suppression (every local
+    maximum becomes a marker). In practice, some suppression/smoothing is
+    usually needed to avoid oversegmentation — tune these for your dataset.
 
     Parameters
     ----------
@@ -315,11 +329,14 @@ def segment_slice(
     output_dir : str
         Directory where the labelled TIFF will be written.
     opening_radius : int, optional
-        Radius for morphological opening (0 = skip).
+        Radius for morphological opening (0 = skip, default).
     min_size : int, optional
-        Minimum connected-component area in pixels to retain.
+        Minimum connected-component area in pixels to retain (0 = no
+        filtering, default).
     h_max_threshold : float, optional
-        Height parameter for ``h_maxima`` peak suppression.
+        Height parameter for ``h_maxima`` peak suppression (0 = no
+        suppression, default; typically needs a positive value to avoid
+        oversegmentation).
     gaussian_sigma : float, optional
         Sigma for Gaussian smoothing of the binary mask.
     distance_sigma : float, optional
@@ -594,7 +611,10 @@ def load_instance_volume(folder: str) -> np.ndarray:
     np.ndarray
         3D integer array (Z × H × W).
     """
-    tif_files = sorted(f for f in os.listdir(folder) if f.endswith(".tif"))
+    tif_files = sorted(
+        (f for f in os.listdir(folder) if f.endswith(".tif")),
+        key=_extract_index,
+    )
     if not tif_files:
         raise FileNotFoundError(f"No TIF files found in {folder}")
 
@@ -635,55 +655,156 @@ def _extract_index(file_path: str) -> int:
 # CLI entry point
 # ---------------------------------------------------------------------------
 
+def segment_directory(
+    input_dir: str,
+    output_dir: str,
+    opening_radius: int,
+    min_size: int,
+    h_max_threshold: float,
+    gaussian_sigma: float,
+    distance_sigma: float,
+) -> None:
+    """Run :func:`segment_slice` (watershed instance segmentation) on every
+    PNG mask in *input_dir*, writing one labelled TIFF per slice to
+    *output_dir*.
+    """
+    png_files = sorted(
+        (f for f in os.listdir(input_dir) if f.endswith(".png")),
+        key=_extract_index,
+    )
+    if not png_files:
+        raise FileNotFoundError(f"No PNG files found in {input_dir}")
+
+    for f in tqdm(png_files, desc="Segmenting slices"):
+        segment_slice(
+            os.path.join(input_dir, f),
+            output_dir,
+            opening_radius=opening_radius,
+            min_size=min_size,
+            h_max_threshold=h_max_threshold,
+            gaussian_sigma=gaussian_sigma,
+            distance_sigma=distance_sigma,
+        )
+
+
 def main() -> None:
-    """Example pipeline: load → filter → extract features → save CSV."""
+    """CLI for the full pipeline: per-slice watershed segmentation, cross-slice
+    instance tracking, z-span filtering, and morphological feature extraction.
+    """
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Extract 3D morphological features from instance-segmented EM volumes."
+        description="3D morphological feature extraction from EM volumes: "
+                     "watershed segmentation, cross-slice tracking, and "
+                     "PyRadiomics-based feature extraction."
     )
     parser.add_argument(
+        "--log-file", default=None, help="Optional log file path."
+    )
+    sub = parser.add_subparsers(dest="command", required=True,
+                                 help="Pipeline stage to run.")
+
+    # --- segment: per-slice watershed instance segmentation ---
+    sg = sub.add_parser(
+        "segment",
+        help="Watershed-based instance segmentation of 2D binary masks.",
+    )
+    sg.add_argument("--input-dir", required=True,
+                     help="Directory of binary mask PNGs (one per slice).")
+    sg.add_argument("--output-dir", required=True,
+                     help="Directory for labelled TIFF output.")
+    sg.add_argument("--opening-radius", type=int, default=0,
+                     help="Morphological opening radius in pixels "
+                          "(default: 0, i.e. skip). Dataset-specific.")
+    sg.add_argument("--min-size", type=int, default=0,
+                     help="Minimum connected-component area (pixels) to "
+                          "retain (default: 0, i.e. no filtering). "
+                          "Dataset-specific.")
+    sg.add_argument("--h-max-threshold", type=float, default=0.0,
+                     help="Height parameter for h-maxima peak suppression "
+                          "(default: 0, i.e. no suppression). Usually needs "
+                          "a positive value to avoid oversegmentation — "
+                          "dataset-specific.")
+    sg.add_argument("--gaussian-sigma", type=float, default=0.0,
+                     help="Sigma for Gaussian smoothing of the binary mask "
+                          "(default: 0, i.e. no smoothing). Dataset-specific.")
+    sg.add_argument("--distance-sigma", type=float, default=0.0,
+                     help="Sigma for Gaussian smoothing of the distance "
+                          "transform (default: 0, i.e. no smoothing). "
+                          "Dataset-specific.")
+
+    # --- track: cross-slice instance tracking ---
+    tk = sub.add_parser(
+        "track", help="Assign consistent 3D instance IDs across slices.",
+    )
+    tk.add_argument("--input-dir", required=True,
+                     help="Directory of per-slice labelled TIFFs (output of "
+                          "'segment').")
+    tk.add_argument("--output-dir", required=True,
+                     help="Directory for full-resolution tracked TIFFs.")
+    tk.add_argument("--downsampled-dir", default=None,
+                     help="Optional directory for downsampled tracked TIFFs.")
+    tk.add_argument("--full-height", type=int, required=True,
+                     help="Height (pixels) of the full-resolution label maps.")
+    tk.add_argument("--full-width", type=int, required=True,
+                     help="Width (pixels) of the full-resolution label maps.")
+    tk.add_argument("--downsample-height", type=int, default=None,
+                     help="Height for downsampled copies (required if "
+                          "--downsampled-dir is set).")
+    tk.add_argument("--downsample-width", type=int, default=None,
+                     help="Width for downsampled copies (required if "
+                          "--downsampled-dir is set).")
+    tk.add_argument("--dist-thresh", type=float, required=True,
+                     help="Maximum centroid distance (pixels) for matching "
+                          "instances between slices. Dataset-specific.")
+    tk.add_argument("--iou-thresh", type=float, required=True,
+                     help="Minimum IoU for matching instances between "
+                          "slices. Dataset-specific.")
+
+    # --- extract: z-filter + feature extraction ---
+    ex = sub.add_parser(
+        "extract",
+        help="Z-span filter tracked instances and extract shape features.",
+    )
+    ex.add_argument(
         "--instance-dir",
         required=True,
-        help="Directory of instance-labelled TIFF slices.",
+        help="Directory of instance-labelled TIFF slices (output of 'track').",
     )
-    parser.add_argument(
+    ex.add_argument(
         "--em-dir",
         required=True,
         help="Directory of EM image slices (PNG).",
     )
-    parser.add_argument(
+    ex.add_argument(
         "--output-csv",
         required=True,
         help="Path for the output feature CSV.",
     )
-    parser.add_argument(
+    ex.add_argument(
         "--z-threshold",
         type=int,
-        default=6,
-        help="Minimum z-span to retain an instance.",
+        required=True,
+        help="Minimum z-span (slices) to retain an instance. Dataset-specific"
+             " — depends on section thickness and structure size.",
     )
-    parser.add_argument(
+    ex.add_argument(
         "--xy-scale",
         type=float,
-        default=5.0,
-        help="XY scale factor from working to full resolution.",
+        required=True,
+        help="XY scale factor from working to full resolution. "
+             "Dataset-specific.",
     )
-    parser.add_argument(
+    ex.add_argument(
         "--n-jobs",
         type=int,
-        default=16,
-        help="Number of parallel workers (default: 16).",
+        default=-1,
+        help="Number of parallel workers (default: -1, i.e. all cores).",
     )
-    parser.add_argument(
+    ex.add_argument(
         "--id-map-csv",
         default=None,
         help="Optional path to save the original→filtered ID mapping.",
-    )
-    parser.add_argument(
-        "--log-file",
-        default=None,
-        help="Optional log file path.",
     )
     args = parser.parse_args()
 
@@ -697,21 +818,50 @@ def main() -> None:
         handlers=handlers,
     )
 
-    # Pipeline
-    volume = load_instance_volume(args.instance_dir)
-    filtered = filter_by_z_span(
-        volume, z_threshold=args.z_threshold, id_map_csv=args.id_map_csv
-    )
-    del volume
+    if args.command == "segment":
+        segment_directory(
+            input_dir=args.input_dir,
+            output_dir=args.output_dir,
+            opening_radius=args.opening_radius,
+            min_size=args.min_size,
+            h_max_threshold=args.h_max_threshold,
+            gaussian_sigma=args.gaussian_sigma,
+            distance_sigma=args.distance_sigma,
+        )
 
-    morph = MorphDescriptor(filtered, args.em_dir)
-    features_df, _ = morph.extract_features(
-        xy_scale_factor=args.xy_scale, n_jobs=args.n_jobs
-    )
+    elif args.command == "track":
+        if args.downsampled_dir is not None and (
+            args.downsample_height is None or args.downsample_width is None
+        ):
+            parser.error(
+                "--downsample-height and --downsample-width are required "
+                "when --downsampled-dir is set."
+            )
+        track_instances_across_slices(
+            labelled_slices_dir=args.input_dir,
+            output_dir=args.output_dir,
+            downsampled_dir=args.downsampled_dir,
+            full_shape=(args.full_height, args.full_width),
+            downsample_shape=(args.downsample_height, args.downsample_width),
+            dist_thresh=args.dist_thresh,
+            iou_thresh=args.iou_thresh,
+        )
 
-    os.makedirs(os.path.dirname(args.output_csv), exist_ok=True)
-    features_df.to_csv(args.output_csv, index=False)
-    logger.info("Features saved to %s", args.output_csv)
+    elif args.command == "extract":
+        volume = load_instance_volume(args.instance_dir)
+        filtered = filter_by_z_span(
+            volume, z_threshold=args.z_threshold, id_map_csv=args.id_map_csv
+        )
+        del volume
+
+        morph = MorphDescriptor(filtered, args.em_dir)
+        features_df, _ = morph.extract_features(
+            xy_scale_factor=args.xy_scale, n_jobs=args.n_jobs
+        )
+
+        os.makedirs(os.path.dirname(args.output_csv), exist_ok=True)
+        features_df.to_csv(args.output_csv, index=False)
+        logger.info("Features saved to %s", args.output_csv)
 
 
 if __name__ == "__main__":

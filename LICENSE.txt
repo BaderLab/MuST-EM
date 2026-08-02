@@ -1,6 +1,13 @@
+This license applies to the original code in this repository, i.e. everything
+outside the `nnUNet/` and `SAM2/` directories (`mito_er_analysis.py`,
+`morphology_features.py`, `sam2maskpropagator.py`, and associated scripts).
+`nnUNet/` and `SAM2/` contain modified copies of third-party projects
+distributed under the Apache License, Version 2.0; see `nnUNet/LICENSE`,
+`nnUNet/NOTICE.md`, `SAM2/LICENSE`, and `SAM2/NOTICE.md` for details.
+
 MIT License
 
-Copyright (c) 2025 Bader Lab, University of Toronto
+Copyright (c) 2026 Bader Lab, University of Toronto
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

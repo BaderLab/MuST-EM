@@ -34,10 +34,10 @@ Ravi, N. et al. SAM 2: Segment Anything in Images and Videos.
 
 import os
 import gc
+import json
 import logging
 from typing import Dict, List, Optional, Tuple
 
-import cv2
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
@@ -62,7 +62,7 @@ def overlay_mask(
     mask: np.ndarray,
     ax: plt.Axes,
     obj_id: Optional[int] = None,
-    alpha: float = None,
+    alpha: float = 0.5,
 ) -> None:
     """Overlay a coloured semi-transparent mask on a matplotlib Axes.
 
@@ -75,7 +75,7 @@ def overlay_mask(
     obj_id : int, optional
         Object ID used to select a colour from the ``tab10`` colour-map.
     alpha : float
-        Overlay opacity.
+        Overlay opacity (purely cosmetic; default 0.5).
     """
     mask = mask.astype(np.float32) / 255.0
     cmap = plt.get_cmap("tab10")
@@ -327,9 +327,11 @@ class SAM2VideoMaskPropagator:
 
     # ---- SWC prompt generation ----
 
-    @staticmethod
-    def _find_frame_index(slice_id: int, image_dir: str) -> Optional[int]:
+    def _find_frame_index(self, slice_id: int, image_dir: str) -> Optional[int]:
         """Return the frame index whose filename contains *slice_id*.
+
+        Uses the same ``self._frame_sort_key`` ordering as ``self.frame_names``
+        so indices returned here line up with frames indexed elsewhere.
 
         Parameters
         ----------
@@ -342,7 +344,8 @@ class SAM2VideoMaskPropagator:
         -------
         int or None
         """
-        for i, fname in enumerate(sorted(os.listdir(image_dir))):
+        names = sorted(os.listdir(image_dir), key=self._frame_sort_key)
+        for i, fname in enumerate(names):
             if f"{slice_id:03d}" in fname:
                 return i
         return None
@@ -460,23 +463,24 @@ class SAM2VideoMaskPropagator:
             if mid_idx is None:
                 continue
 
-            # Load the appropriate image
+            # Load the appropriate image. `mid_idx` is a position into
+            # `self.frame_names` (video_dir); for the hepatocyte branch this
+            # assumes mask_dir contains the same number of files, in the same
+            # frame order, as video_dir.
             if self.label_type == "hepatocyte":
-                img_path = os.path.join(
-                    self.mask_dir, sorted(os.listdir(self.mask_dir))[mid_idx]
+                mask_names = sorted(
+                    os.listdir(self.mask_dir), key=self._frame_sort_key
                 )
+                img_path = os.path.join(self.mask_dir, mask_names[mid_idx])
                 image = np.array(Image.open(img_path).convert("RGB"))
                 binary = (image > 0).astype(bool)
                 image = (skeletonize(binary) * 255).astype(np.uint8)
             else:
-                img_path = os.path.join(
-                    self.video_dir, sorted(os.listdir(self.video_dir))[mid_idx]
-                )
+                img_path = os.path.join(self.video_dir, self.frame_names[mid_idx])
                 image = np.array(Image.open(img_path).convert("RGB"))
-                if image.max() > 255 or image.min() < 0:
-                    image = np.uint8(
-                        255 * (image - image.min()) / (image.max() - image.min())
-                    )
+                img_range = image.max() - image.min()
+                if (image.max() > 255 or image.min() < 0) and img_range > 0:
+                    image = np.uint8(255 * (image - image.min()) / img_range)
 
             # Crop around the SWC coordinate
             top_y = max(int(coords[0] - half), 0)
@@ -720,12 +724,30 @@ def main():
     parser.add_argument("--mode", type=str, default="propagate",
                         choices=["generate_prompts", "propagate", "video_only"],
                         help="Pipeline stage to execute.")
+    parser.add_argument(
+        "--box_prompts_json", type=str, default=None,
+        help="Required for --mode video_only. Path to a JSON file containing "
+             "a list of box prompts, e.g. "
+             '[{"obj_id": 1, "frame_idx": 0, "box": [x0, y0, x1, y1]}, ...]. '
+             "Frame indices, object IDs, and box coordinates are dataset- "
+             "and structure-specific and must be supplied by the user.",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s  %(levelname)-8s  %(message)s",
     )
+
+    ann_obj_id = ann_frame_idx = box = None
+    if args.mode == "video_only":
+        if not args.box_prompts_json:
+            parser.error("--mode video_only requires --box_prompts_json.")
+        with open(args.box_prompts_json, "r") as fh:
+            prompts = json.load(fh)
+        ann_obj_id = [p["obj_id"] for p in prompts]
+        ann_frame_idx = [p["frame_idx"] for p in prompts]
+        box = [p["box"] for p in prompts]
 
     propagator = SAM2VideoMaskPropagator(
         model_cfg=args.model_cfg,
@@ -737,6 +759,9 @@ def main():
         input_swc_dir=args.swc_dir,
         mask_dir=args.mask_dir,
         output_visual_dir=args.visual_dir,
+        ann_obj_id=ann_obj_id,
+        ann_frame_idx=ann_frame_idx,
+        box=box,
     )
 
     if args.mode == "generate_prompts":

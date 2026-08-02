@@ -1,5 +1,3 @@
-import sys
-sys.path.append('/home/codee/scratch/nnUNet')
 import argparse
 from typing import Union
 
